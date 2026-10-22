@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>SHOW YOU PROPERTY 지도</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #EEF1F5; font-family: "Noto Sans KR", -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  #kmap { position: absolute; inset: 0; }
+  .mapnote { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 24px; color: #4A5568; font-size: 14px; line-height: 1.7; }
+  /* 관리현황 화면의 핀 모양과 동일 */
+  .kpin { display: flex; flex-direction: column; align-items: center; transform: translateY(-6px); cursor: pointer; }
+  .kpin .lb { background: #fff; border: 2px solid currentColor; border-radius: 14px; padding: 3px 10px; font-size: 13px; font-weight: 700; white-space: nowrap; box-shadow: 0 2px 6px rgba(27,42,68,.18); }
+  .kpin .lb small { font-weight: 600; margin-left: 4px; color: #C53030; }
+  .kpin .tail { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 7px solid currentColor; }
+  .kpin.off .lb { background: #FBF7EE; }
+  .kpin.sel .lb { background: currentColor; }
+  .kpin.sel .lb span, .kpin.sel .lb small { color: #fff; }
+</style>
+</head>
+<body>
+<div id="kmap"></div>
+<div id="note" class="mapnote">지도를 불러오는 중…</div>
+
+<script>
+/*
+  쇼유프로퍼티 관리현황(Apps Script) 안에 iframe으로 들어가는 지도 전용 페이지.
+  카카오에는 이 페이지의 고정 도메인만 등록하면 되므로, 직원 수가 늘어도 설정을 바꿀 필요가 없음.
+  데이터는 이 파일에 없고, 로그인한 직원의 관리현황 화면이 postMessage로 넘겨줌.
+*/
+// 카카오 키는 이 공개 파일에 넣지 않고, 관리현황 화면이 'init' 메시지로 넘겨줌
+// 관리현황 화면(Apps Script 샌드박스)만 이 지도를 조종할 수 있음
+var ALLOWED_PARENT = /^https:\/\/[a-z0-9-]+-script\.googleusercontent\.com$/;
+
+var KMAP = null, KGEO = null, KPLACES = null, PINS = {}, GEN = 0, PARENT = null, QUEUE = [];
+
+function note(t){ var n = document.getElementById('note'); n.style.display = t ? 'flex' : 'none'; n.innerHTML = t || ''; }
+function send(m){ if (PARENT) window.parent.postMessage(m, PARENT); }
+
+// 핀 클릭 → 관리현황 화면에 선택 알림
+function openMapKey(key){ send({ type: 'select', key: String(key || '') }); }
+
+var LOADING = false;
+function load(key){
+  if (LOADING) return; LOADING = true;
+  var s = document.createElement('script');
+  s.src = 'https://dapi.kakao.com/v2/maps/sdk.js?autoload=false&libraries=services&appkey=' + encodeURIComponent(key);
+  s.onload = function(){
+    kakao.maps.load(function(){
+      note('');
+      KMAP = new kakao.maps.Map(document.getElementById('kmap'), { center: new kakao.maps.LatLng(37.56, 126.92), level: 9 });
+      KMAP.addControl(new kakao.maps.ZoomControl(), kakao.maps.ControlPosition.RIGHT);
+      KGEO = new kakao.maps.services.Geocoder();
+      KPLACES = new kakao.maps.services.Places();
+      var q = QUEUE; QUEUE = []; q.forEach(handle);
+      hello();
+    });
+  };
+  s.onerror = function(){
+    note('카카오맵을 불러오지 못했습니다.<br>카카오 개발자 사이트의 <b>Web 도메인 등록</b>을 확인해 주세요.');
+    hello('error');
+  };
+  document.head.appendChild(s);
+}
+
+// 상태 알림. 부모 주소를 아직 모를 때는 '*'로 보내지만 데이터는 담지 않음.
+function hello(st){ window.parent.postMessage({ type: 'kmap-hello', status: st || 'ready' }, PARENT || '*'); }
+hello('need-init');
+
+window.addEventListener('message', function(e){
+  if (!ALLOWED_PARENT.test(e.origin)) return;
+  PARENT = e.origin;
+  var d = e.data || {};
+  if (d.type === 'init') { if (d.key) load(d.key); return; }
+  if (d.type === 'ping') return hello(KMAP ? 'ready' : (LOADING ? 'loading' : 'need-init'));
+  if (!KMAP) { QUEUE.push(d); return; }
+  handle(d);
+});
+
+function handle(d){
+  if (d.type === 'draw') draw(d);
+  if (d.type === 'fit') fit(d.sel);
+  if (d.type === 'relayout') { KMAP.relayout(); fit(d.sel); }
+}
+
+function geoCache(addr, v){
+  try {
+    var k = 'kgeo:' + addr;
+    if (v) { localStorage.setItem(k, JSON.stringify(v)); return v; }
+    var x = localStorage.getItem(k); return x ? JSON.parse(x) : null;
+  } catch (e) { return v || null; }
+}
+
+function geocode(addr, cb, fail){
+  var c = geoCache(addr); if (c) return cb(c);
+  try {
+    KGEO.addressSearch(addr, function(res, st){
+      if (st === kakao.maps.services.Status.OK && res[0]) return cb(geoCache(addr, { y: +res[0].y, x: +res[0].x }));
+      // 주소로 못 찾으면 키워드 검색으로 한 번 더
+      KPLACES.keywordSearch(addr, function(r2, st2){
+        if (st2 === kakao.maps.services.Status.OK && r2[0]) return cb(geoCache(addr, { y: +r2[0].y, x: +r2[0].x }));
+        fail.push(addr + ' (' + st + '/' + st2 + ')');
+        cb(null);
+      });
+    });
+  } catch (e) { fail.push(addr + ' (' + e.message + ')'); cb(null); }
+}
+
+// d.pins: [{ key, q, html, z }], d.sel: 선택된 key
+function draw(d){
+  var gen = ++GEN, fail = [], pos = {};
+  Object.keys(PINS).forEach(function(k){ PINS[k].ov.setMap(null); });
+  PINS = {};
+  var pins = d.pins || [], left = pins.length;
+  if (!left) { send({ type: 'drawn', gen: d.gen, pos: pos, fail: fail }); return; }
+  pins.forEach(function(p){
+    geocode(p.q, function(g){
+      if (gen !== GEN) return;   // 더 새로 그리는 중이면 이 결과는 버림
+      if (g) {
+        var ll = new kakao.maps.LatLng(g.y, g.x);
+        var ov = new kakao.maps.CustomOverlay({ position: ll, content: p.html, yAnchor: 1, zIndex: p.z || 1 });
+        ov.setMap(KMAP);
+        PINS[p.key] = { ov: ov, ll: ll };
+        pos[p.key] = g;
+      }
+      if (--left === 0) {
+        fit(d.sel);
+        send({ type: 'drawn', gen: d.gen, pos: pos, fail: fail });
+      }
+    }, fail);
+  });
+}
+
+function fit(sel){
+  if (!KMAP) return;
+  KMAP.relayout();
+  if (sel && PINS[sel]) { KMAP.setLevel(3); KMAP.setCenter(PINS[sel].ll); return; }
+  var keys = Object.keys(PINS); if (!keys.length) return;
+  var b = new kakao.maps.LatLngBounds();
+  keys.forEach(function(k){ b.extend(PINS[k].ll); });
+  KMAP.setBounds(b, 60, 60, 60, 60);
+}
+</script>
+</body>
+</html>
